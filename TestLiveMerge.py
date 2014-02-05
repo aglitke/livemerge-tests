@@ -11,9 +11,20 @@ from testrunner import permutations, expandPermutations
 
 IMAGEDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         'tmp')
-IMAGESIZE = '1M'
+IMAGESIZE = '100M'
 
 _blockdevs = {}
+
+
+# Create a 3-D matrix of test permutations.  It does not make sense to
+# use relative paths with block devices so we exclude those combos.
+liveMergePermutations = [[relPath, baseFmt, block]
+                         for relPath in (True, False)
+                         for baseFmt in ('raw', 'qcow2')
+                         for block in (True, False)
+                         if not (block and relPath)
+                        ]
+
 
 def _patch_subprocess():
     def check_output(cmd):
@@ -65,21 +76,22 @@ def create_block_dev(name):
     output = subprocess.check_output(cmd)
     if not output.startswith('/dev/loop'):
         raise ValueError("Unexpected output from losetup: %s" % output)
-        dev = output[:-1]  # Strip trailing newline
-        if not os.path.exists(dev):
-            raise Exception("Missing loop device.  To fix this please "
-                            "run 'mknod -m 0660 %s b 7 %s' and retry." %
-                            (dev, dev[9:]))
-        fname = "%s/%s.img" % (IMAGEDIR, name)
-        dd = ['dd', 'if=/dev/zero', 'of=%s' % fname, 'bs=1M', 'count=2']
-        losetup = ['losetup', dev, fname]
-        outf = open('/dev/null', 'w')
-        try:
-            subprocess.check_call(dd, stdout=outf, stderr=outf)
-            subprocess.check_call(losetup, stdout=outf, stderr=outf)
-        finally:
-            outf.close()
-        _blockdevs[name] = dev
+
+    dev = output[:-1]  # Strip trailing newline
+    if not os.path.exists(dev):
+        raise Exception("Missing loop device.  To fix this please "
+                        "run 'mknod -m 0660 %s b 7 %s' and retry." %
+                        (dev, dev[9:]))
+    fname = "%s/%s.img" % (IMAGEDIR, name)
+    dd = ['dd', 'if=/dev/zero', 'of=%s' % fname, 'bs=%s' % IMAGESIZE, 'count=1']
+    losetup = ['losetup', dev, fname]
+    outf = open('/dev/null', 'w')
+    try:
+        subprocess.check_call(dd, stdout=outf, stderr=outf)
+        subprocess.check_call(losetup, stdout=outf, stderr=outf)
+    finally:
+        outf.close()
+    _blockdevs[name] = dev
 
 
 def create_image(name, backing=None, fmt='qcow2', backingFmt='qcow2',
@@ -117,15 +129,14 @@ def create_image(name, backing=None, fmt='qcow2', backingFmt='qcow2',
 
 
 def cleanup_images():
+    global _blockdevs
     loopdevs = _blockdevs.values()
+    #subprocess.check_call(['losetup', '-l'])
     if loopdevs:
         cmd = ['losetup', '-d']
         cmd.extend(loopdevs)
-        outf = open('/dev/null', 'w')
-        try:
-            subprocess.check_call(cmd, stdout=outf, stderr=outf)
-        finally:
-            outf.close()
+        subprocess.check_call(cmd)
+    _blockdevs = {}
     if os.path.exists(IMAGEDIR):
         shutil.rmtree(IMAGEDIR)
 
@@ -198,6 +209,8 @@ def wait_block_job(dom, path, jobType, timeout=10):
 
 def create_vm(name, image_name, block=False):
     imagefile = get_image_path(image_name, relative=False, block=block)
+    diskType, srcAttr = (('file', 'file'), ('block', 'dev'))[block]
+    srcAttr
     xml = '''
     <domain type='kvm'>
       <name>%(name)s</name>
@@ -207,14 +220,15 @@ def create_vm(name, image_name, block=False):
         <type arch='x86_64'>hvm</type>
       </os>
       <devices>
-        <disk type='file' device='disk'>
+        <disk type='%(diskType)s' device='disk'>
           <driver name='qemu' type='qcow2' backing_format='qcow2'/>
-          <source file='%(imagefile)s' />
+          <source %(srcAttr)s='%(imagefile)s' />
           <target dev='vda' bus='virtio' />
         </disk>
       </devices>
     </domain>
-    ''' % {'name': name, 'imagefile': imagefile}
+    ''' % {'name': name, 'imagefile': imagefile, 'diskType': diskType,
+           'srcAttr': srcAttr}
 
     conn = libvirt_connect()
     return conn.createXML(xml, 0)
@@ -225,10 +239,8 @@ class TestLiveMerge(unittest.TestCase):
     def tearDown(self):
         cleanup_images()
 
-    @permutations([[relPath, baseFmt]
-                   for relPath in (True, False)
-                   for baseFmt in ('raw', 'qcow2')])
-    def test_forward_merge_one_to_active(self, relPath, baseFmt):
+    @permutations(liveMergePermutations)
+    def test_forward_merge_one_to_active(self, relPath, baseFmt, block):
         """
         Forward Merge One to Active Layer
 
@@ -237,15 +249,16 @@ class TestLiveMerge(unittest.TestCase):
         Merge S1 >> S2
         Final image chain:  BASE---S2
         """
-        base_file = create_image('BASE', fmt=baseFmt)
+        base_file = create_image('BASE', fmt=baseFmt, block=block)
         write_image(base_file, 0, 3072, 1)
         s1_file = create_image('S1', 'BASE', relative=relPath,
-                               backingFmt=baseFmt)
+                               backingFmt=baseFmt, block=block)
         write_image(s1_file, 1024, 2048, 2)
-        s2_file = create_image('S2', 'S1', relative=relPath)
+        s2_file = create_image('S2', 'S1', relative=relPath,
+                               block=block)
         write_image(s2_file, 2048, 1024, 3)
 
-        dom = create_vm('livemerge-test', 'S2', block=False)
+        dom = create_vm('livemerge-test', 'S2', block=block)
         try:
             dom.blockRebase(s2_file, base_file, 0, 0)
             flags = libvirt.VIR_DOMAIN_BLOCK_JOB_TYPE_PULL
@@ -259,7 +272,7 @@ class TestLiveMerge(unittest.TestCase):
         self.assertTrue(verify_backing_file(base_file, None))
         self.assertTrue(verify_backing_file(s2_file, 'BASE',
                                             relative=relPath,
-                                            block=False))
+                                            block=block))
         self.assertTrue(verify_image_format(s1_file, 'qcow2'))
 
     def test_forward_merge_all_to_active(self):
@@ -311,10 +324,8 @@ class TestLiveMerge(unittest.TestCase):
                                             relative=False,
                                             block=False))
 
-    @permutations([[relPath, baseFmt]
-                   for relPath in (True, False)
-                   for baseFmt in ('raw', 'qcow2')])
-    def test_backward_merge_from_inactive(self, relPath, baseFmt):
+    @permutations(liveMergePermutations)
+    def test_backward_merge_from_inactive(self, relPath, baseFmt, block):
         """
         Backward Merge One from Inactive Layer
 
@@ -323,19 +334,20 @@ class TestLiveMerge(unittest.TestCase):
         Merge BASE << S1
         Final image chain:  BASE---S2
         """
-        base_file = create_image('BASE', fmt=baseFmt)
+        base_file = create_image('BASE', fmt=baseFmt, block=block)
         s1_file = create_image('S1', 'BASE', relative=relPath,
-                               backingFmt=baseFmt)
-        s2_file = create_image('S2', 'S1', relative=relPath)
+                               backingFmt=baseFmt, block=block)
+        s2_file = create_image('S2', 'S1', relative=relPath,
+                               block=block)
         self.assertTrue(verify_backing_file(base_file, None))
         self.assertTrue(verify_backing_file(s1_file, 'BASE',
                                             relative=relPath,
-                                            block=False))
+                                            block=block))
         self.assertTrue(verify_backing_file(s2_file, 'S1',
                                             relative=relPath,
-                                            block=False))
+                                            block=block))
 
-        dom = create_vm('livemerge-test', 'S2', block=False)
+        dom = create_vm('livemerge-test', 'S2', block=block)
         try:
             dom.blockCommit('vda', base_file, s1_file, 0, 0)
             flags = libvirt.VIR_DOMAIN_BLOCK_JOB_TYPE_COMMIT
@@ -346,6 +358,6 @@ class TestLiveMerge(unittest.TestCase):
         self.assertTrue(verify_backing_file(base_file, None))
         self.assertTrue(verify_backing_file(s2_file, 'BASE',
                                             relative=relPath,
-                                            block=False))
+                                            block=block))
         self.assertTrue(verify_image_format(base_file, baseFmt))
 
