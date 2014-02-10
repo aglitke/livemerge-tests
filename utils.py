@@ -4,10 +4,11 @@ import shutil
 import re
 import libvirt
 import time
+import tempfile
 
 IMAGEDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         'tmp')
-IMAGESIZE = '100M'
+IMAGESIZE = '10M'
 
 _blockdevs = {}
 
@@ -57,7 +58,7 @@ def create_block_dev(name):
 
 
 def create_image(name, backing=None, fmt='qcow2', backingFmt='qcow2',
-                 relative=False, block=False):
+                 relative=False, block=False, size=IMAGESIZE):
     if not os.path.exists(IMAGEDIR):
         os.mkdir(IMAGEDIR, 0755)
 
@@ -77,8 +78,9 @@ def create_image(name, backing=None, fmt='qcow2', backingFmt='qcow2',
             #                     backingfile)
             cmd.extend(['-b', backingfile, '-F', backingFmt, imagefile])
         else:
-            cmd.extend([imagefile, IMAGESIZE])
+            cmd.extend([imagefile, size])
         subprocess.check_call(cmd, stdout=outf, stderr=outf)
+        #subprocess.check_call(cmd)
         os.chmod(imagefile, 0666)
     finally:
         os.chdir(cwd)
@@ -151,6 +153,17 @@ def verify_image_format(imagePath, expectedFmt):
     return False
 
 
+def get_image_end_offset(imagePath):
+    cmd = ['qemu-img', 'check', imagePath]
+    try:
+        output = subprocess.check_output(cmd)
+    except subprocess.CalledProcessError, e:
+        print "qemu-img check returned error: %s" % e.output
+        output = e.output
+    m = re.search('^Image end offset: (\S*)', output, re.M)
+    return int(m.group(1))
+
+
 def libvirt_connect():
     return libvirt.open('qemu:///system')
 
@@ -187,6 +200,7 @@ def create_vm(name, image_name, block=False):
           <source %(srcAttr)s='%(imagefile)s' />
           <target dev='vda' bus='virtio' />
         </disk>
+        <graphics type='vnc' />
       </devices>
     </domain>
     ''' % {'name': name, 'imagefile': imagefile, 'diskType': diskType,
@@ -194,3 +208,25 @@ def create_vm(name, image_name, block=False):
 
     conn = libvirt_connect()
     return conn.createXML(xml, 0)
+
+
+def build_vm(image_name, script, size):
+    if not os.path.exists(IMAGEDIR):
+        os.mkdir(IMAGEDIR, 0755)
+
+    fname = get_image_path('BASE', False, False)
+    cmd = ['virt-builder', 'fedora-20', '--size', size, '-o', fname,
+           '--format', 'qcow2', '--root-password', 'password:passw0rd']
+    if script:
+        script_fd, script_file = tempfile.mkstemp()
+        os.write(script_fd, script)
+        os.close(script_fd)
+        cmd.extend(['--firstboot', script_file])
+
+    try:
+        my_env = os.environ.copy()
+        my_env['LIBGUESTFS_BACKEND'] = 'direct'
+        subprocess.check_call(cmd, env=my_env)
+    finally:
+        if script:
+            os.unlink(script_file)
